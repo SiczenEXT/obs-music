@@ -1,0 +1,49 @@
+name: Build Windows OBS Plugin
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-x64:
+    name: Build Windows x64 plugin
+    runs-on: windows-2022
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Fetch pinned OBS plugin build tooling
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $template = Join-Path $env:RUNNER_TEMP 'obs-plugintemplate'
+          git clone --quiet https://github.com/obsproject/obs-plugintemplate.git $template
+          git -C $template checkout --quiet 3e7d7ac3b5342cd7d9b88890b9c70b472d1520fc
+          Copy-Item (Join-Path $template 'CMakePresets.json') .
+          Copy-Item (Join-Path $template 'cmake') . -Recurse
+          New-Item -ItemType Directory -Force '.github/scripts' | Out-Null
+          Copy-Item (Join-Path $template '.github/scripts/*') '.github/scripts' -Recurse
+
+      - name: Configure, compile and install
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pwsh -NoProfile -File .github/scripts/Build-Windows.ps1 -Target x64 -Configuration Release
+
+      - name: Package plugin
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pwsh -NoProfile -File .github/scripts/Package-Windows.ps1 -Target x64 -Configuration Release
+
+      - name: Upload installable plugin ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: OBS-Music-Folder-Player-Windows-x64
+          path: release/obs-music-folder-1.0.0-windows-x64.zip
+          if-no-files-found: error
+          compression-level: 0
