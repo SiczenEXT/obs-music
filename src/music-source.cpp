@@ -1,4 +1,5 @@
 #include <obs-module.h>
+#include <obs-hotkey.h>
 #include <util/platform.h>
 
 #include <windows.h>
@@ -11,9 +12,10 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <cwctype>
 #include <condition_variable>
 #include <cstdint>
+#include <cwctype>
+#include <deque>
 #include <filesystem>
 #include <mutex>
 #include <string>
@@ -27,17 +29,42 @@ using namespace std::chrono_literals;
 namespace {
 constexpr uint32_t kSampleRate = 48000;
 constexpr uint32_t kChannels = 2;
-constexpr size_t kFramesPerBlock = 1024;
+constexpr size_t kOutputFrames = 480;                 // 10 ms at 48 kHz
+constexpr size_t kPrebufferFrames = kSampleRate / 2; // 500 ms of decoded audio
+constexpr size_t kMaxQueuedFrames = kSampleRate * 3; // 3 seconds ahead
 constexpr uint64_t kNanosecondsPerSecond = 1000000000ULL;
+constexpr uint64_t kBlockDurationNs =
+    static_cast<uint64_t>(kOutputFrames) * kNanosecondsPerSecond / kSampleRate;
+
+struct StereoFrame {
+    float left;
+    float right;
+};
 
 struct MusicFolderSource {
     obs_source_t *source = nullptr;
+
     std::mutex mutex;
     std::condition_variable wake;
-    std::thread worker;
+    std::deque<StereoFrame> audioQueue;
+
+    std::thread decoderThread;
+    std::thread outputThread;
+
     bool stopping = false;
     bool reloadRequested = true;
+    bool restartRequested = false;
+    bool paused = false;
+    bool prebuffering = true;
+
+    int pendingTrackDelta = 0;
+    uint64_t playbackEpoch = 0;
     fs::path folder;
+
+    obs_hotkey_id toggleHotkey = OBS_INVALID_HOTKEY_ID;
+    obs_hotkey_id stopHotkey = OBS_INVALID_HOTKEY_ID;
+    obs_hotkey_id previousHotkey = OBS_INVALID_HOTKEY_ID;
+    obs_hotkey_id nextHotkey = OBS_INVALID_HOTKEY_ID;
 };
 
 static std::wstring utf8_to_wide(const char *text)
@@ -50,7 +77,8 @@ static std::wstring utf8_to_wide(const char *text)
         return {};
 
     std::wstring result(static_cast<size_t>(needed), L'\0');
-    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, result.data(), needed);
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, result.data(), needed))
+        return {};
     result.pop_back();
     return result;
 }
@@ -65,7 +93,8 @@ static std::string wide_to_utf8(const std::wstring &text)
         return {};
 
     std::string result(static_cast<size_t>(needed), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, result.data(), needed, nullptr, nullptr);
+    if (!WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, result.data(), needed, nullptr, nullptr))
+        return {};
     result.pop_back();
     return result;
 }
@@ -76,8 +105,6 @@ static bool is_supported_audio_file(const fs::path &file)
     std::transform(ext.begin(), ext.end(), ext.begin(),
                    [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
 
-    // Windows Media Foundation can decode these common local audio formats.
-    // Actual decoder availability depends on the Windows codec installation.
     return ext == L".mp3" || ext == L".wav" || ext == L".flac" ||
            ext == L".m4a" || ext == L".aac" || ext == L".wma";
 }
@@ -140,8 +167,7 @@ static HRESULT create_audio_reader(const fs::path &file, ComPtr<IMFSourceReader>
     hr = outputType->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
                                kSampleRate * kChannels * sizeof(int16_t));
     if (FAILED(hr)) return hr;
-    hr = outputType->SetUINT32(MF_MT_AUDIO_CHANNEL_MASK,
-                               0x00000003U);
+    hr = outputType->SetUINT32(MF_MT_AUDIO_CHANNEL_MASK, 0x00000003U);
     if (FAILED(hr)) return hr;
     hr = outputType->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
     if (FAILED(hr)) return hr;
@@ -154,73 +180,162 @@ static HRESULT create_audio_reader(const fs::path &file, ComPtr<IMFSourceReader>
     return reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM, nullptr, outputType.Get());
 }
 
-static bool should_stop_or_reload(MusicFolderSource *state)
+static void request_reload(MusicFolderSource *state)
 {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    return state->stopping || state->reloadRequested;
+    if (!state)
+        return;
+
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->reloadRequested = true;
+        state->restartRequested = false;
+        state->pendingTrackDelta = 0;
+        state->audioQueue.clear();
+        state->prebuffering = true;
+        ++state->playbackEpoch;
+    }
+    state->wake.notify_all();
 }
 
-static bool wait_for_audio_time(MusicFolderSource *state,
-                                std::chrono::steady_clock::time_point deadline)
+static void toggle_playback(MusicFolderSource *state)
 {
-    std::unique_lock<std::mutex> lock(state->mutex);
-    state->wake.wait_until(lock, deadline, [state] {
-        return state->stopping || state->reloadRequested;
-    });
-    return !state->stopping && !state->reloadRequested;
-}
+    if (!state)
+        return;
 
-static bool output_interleaved_pcm16(MusicFolderSource *state,
-                                     const int16_t *interleaved,
-                                     size_t totalFrames,
-                                     uint64_t &nextTimestamp,
-                                     std::chrono::steady_clock::time_point &deadline)
-{
-    std::array<float, kFramesPerBlock> left{};
-    std::array<float, kFramesPerBlock> right{};
-
-    size_t offset = 0;
-    while (offset < totalFrames) {
-        if (should_stop_or_reload(state))
-            return false;
-
-        const size_t frames = std::min(kFramesPerBlock, totalFrames - offset);
-        for (size_t i = 0; i < frames; ++i) {
-            left[i] = static_cast<float>(interleaved[(offset + i) * 2]) / 32768.0f;
-            right[i] = static_cast<float>(interleaved[(offset + i) * 2 + 1]) / 32768.0f;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->paused = !state->paused;
+        if (!state->paused) {
+            state->prebuffering = true;
+            ++state->playbackEpoch;
         }
+    }
+    state->wake.notify_all();
+}
 
-        const uint64_t durationNs =
-            static_cast<uint64_t>(frames) * kNanosecondsPerSecond / kSampleRate;
-        const uint64_t now = os_gettime_ns();
-        if (nextTimestamp < now)
-            nextTimestamp = now;
+static void stop_playback(MusicFolderSource *state)
+{
+    if (!state)
+        return;
 
-        const auto steadyNow = std::chrono::steady_clock::now();
-        if (deadline < steadyNow)
-            deadline = steadyNow;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->paused = true;
+        state->restartRequested = true;
+        state->pendingTrackDelta = 0;
+        state->audioQueue.clear();
+        state->prebuffering = true;
+        ++state->playbackEpoch;
+    }
+    state->wake.notify_all();
+}
 
-        obs_source_audio audio{};
-        audio.data[0] = reinterpret_cast<const uint8_t *>(left.data());
-        audio.data[1] = reinterpret_cast<const uint8_t *>(right.data());
-        audio.frames = static_cast<uint32_t>(frames);
-        audio.speakers = SPEAKERS_STEREO;
-        audio.format = AUDIO_FORMAT_FLOAT_PLANAR;
-        audio.samples_per_sec = kSampleRate;
-        audio.timestamp = nextTimestamp;
+static void skip_track(MusicFolderSource *state, int delta)
+{
+    if (!state || delta == 0)
+        return;
 
-        obs_source_output_audio(state->source, &audio);
-        nextTimestamp += durationNs;
-        deadline += std::chrono::nanoseconds(durationNs);
-        offset += frames;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->pendingTrackDelta += delta;
+        state->restartRequested = false;
+        state->audioQueue.clear();
+        state->prebuffering = true;
+        ++state->playbackEpoch;
+    }
+    state->wake.notify_all();
+}
 
-        if (!wait_for_audio_time(state, deadline))
+static bool take_decoder_command(MusicFolderSource *state,
+                                 fs::path &folder,
+                                 std::vector<fs::path> &tracks,
+                                 size_t &trackIndex,
+                                 ComPtr<IMFSourceReader> &reader)
+{
+    bool reload = false;
+    bool restart = false;
+    int delta = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->stopping)
             return false;
+
+        if (state->reloadRequested) {
+            folder = state->folder;
+            state->reloadRequested = false;
+            state->restartRequested = false;
+            state->pendingTrackDelta = 0;
+            reload = true;
+        } else if (state->restartRequested) {
+            state->restartRequested = false;
+            restart = true;
+        } else if (state->pendingTrackDelta != 0) {
+            delta = state->pendingTrackDelta;
+            state->pendingTrackDelta = 0;
+        }
+    }
+
+    if (reload) {
+        reader.Reset();
+        tracks = scan_folder(folder);
+        trackIndex = 0;
+
+        if (tracks.empty() && !folder.empty()) {
+            blog(LOG_WARNING, "[Music Folder Player] No supported audio files found in the selected folder.");
+        } else if (!tracks.empty()) {
+            blog(LOG_INFO, "[Music Folder Player] Found %zu audio file(s).", tracks.size());
+        }
+    } else if (restart) {
+        reader.Reset();
+        trackIndex = 0;
+    } else if (delta != 0) {
+        reader.Reset();
+        if (!tracks.empty()) {
+            const long long count = static_cast<long long>(tracks.size());
+            long long next = static_cast<long long>(trackIndex) + delta;
+            next %= count;
+            if (next < 0)
+                next += count;
+            trackIndex = static_cast<size_t>(next);
+        }
+    }
+
+    return true;
+}
+
+static bool push_pcm16_to_queue(MusicFolderSource *state,
+                                const int16_t *pcm,
+                                size_t frames)
+{
+    size_t offset = 0;
+    while (offset < frames) {
+        std::unique_lock<std::mutex> lock(state->mutex);
+        state->wake.wait(lock, [state] {
+            return state->stopping || state->reloadRequested ||
+                   state->restartRequested || state->pendingTrackDelta != 0 ||
+                   state->audioQueue.size() < kMaxQueuedFrames;
+        });
+
+        if (state->stopping || state->reloadRequested ||
+            state->restartRequested || state->pendingTrackDelta != 0)
+            return false;
+
+        const size_t available = kMaxQueuedFrames - state->audioQueue.size();
+        const size_t count = std::min(available, frames - offset);
+        for (size_t i = 0; i < count; ++i) {
+            const float left = static_cast<float>(pcm[(offset + i) * 2]) / 32768.0f;
+            const float right = static_cast<float>(pcm[(offset + i) * 2 + 1]) / 32768.0f;
+            state->audioQueue.push_back({left, right});
+        }
+        offset += count;
+        lock.unlock();
+        state->wake.notify_all();
     }
     return true;
 }
 
-static void worker_main(MusicFolderSource *state)
+static void decoder_main(MusicFolderSource *state)
 {
     const HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const bool uninitializeCom = SUCCEEDED(coHr);
@@ -233,40 +348,31 @@ static void worker_main(MusicFolderSource *state)
     fs::path folder;
     std::vector<fs::path> tracks;
     size_t trackIndex = 0;
+    size_t failedTracksInARow = 0;
     ComPtr<IMFSourceReader> reader;
-    uint64_t nextTimestamp = os_gettime_ns();
-    auto deadline = std::chrono::steady_clock::now();
 
     for (;;) {
-        bool reload = false;
+        if (!take_decoder_command(state, folder, tracks, trackIndex, reader))
+            break;
+
         {
-            std::lock_guard<std::mutex> lock(state->mutex);
+            std::unique_lock<std::mutex> lock(state->mutex);
+            state->wake.wait(lock, [state] {
+                return state->stopping || state->reloadRequested ||
+                       state->restartRequested || state->pendingTrackDelta != 0 ||
+                       state->audioQueue.size() < kMaxQueuedFrames;
+            });
             if (state->stopping)
                 break;
-            if (state->reloadRequested) {
-                folder = state->folder;
-                state->reloadRequested = false;
-                reload = true;
-            }
-        }
-
-        if (reload) {
-            reader.Reset();
-            tracks = scan_folder(folder);
-            trackIndex = 0;
-            nextTimestamp = os_gettime_ns();
-            deadline = std::chrono::steady_clock::now();
-            if (tracks.empty() && !folder.empty()) {
-                blog(LOG_WARNING, "[Music Folder Player] No supported audio files found in the selected folder.");
-            } else if (!tracks.empty()) {
-                blog(LOG_INFO, "[Music Folder Player] Found %zu audio file(s).", tracks.size());
-            }
+            if (state->reloadRequested || state->restartRequested || state->pendingTrackDelta != 0)
+                continue;
         }
 
         if (tracks.empty()) {
             std::unique_lock<std::mutex> lock(state->mutex);
             state->wake.wait_for(lock, 500ms, [state] {
-                return state->stopping || state->reloadRequested;
+                return state->stopping || state->reloadRequested ||
+                       state->restartRequested || state->pendingTrackDelta != 0;
             });
             continue;
         }
@@ -278,17 +384,23 @@ static void worker_main(MusicFolderSource *state)
                 blog(LOG_WARNING, "[Music Folder Player] Could not open a track (0x%08X); skipping it.",
                      static_cast<unsigned int>(openHr));
                 trackIndex = (trackIndex + 1) % tracks.size();
-                std::unique_lock<std::mutex> lock(state->mutex);
-                state->wake.wait_for(lock, 200ms, [state] {
-                    return state->stopping || state->reloadRequested;
-                });
+                ++failedTracksInARow;
+
+                if (failedTracksInARow >= tracks.size()) {
+                    blog(LOG_ERROR, "[Music Folder Player] None of the files in the folder could be decoded.");
+                    std::unique_lock<std::mutex> lock(state->mutex);
+                    state->wake.wait_for(lock, 1500ms, [state] {
+                        return state->stopping || state->reloadRequested ||
+                               state->restartRequested || state->pendingTrackDelta != 0;
+                    });
+                    failedTracksInARow = 0;
+                }
                 continue;
             }
 
+            failedTracksInARow = 0;
             const std::string trackName = wide_to_utf8(track.filename().wstring());
             blog(LOG_INFO, "[Music Folder Player] Now playing: %s", trackName.c_str());
-            nextTimestamp = os_gettime_ns();
-            deadline = std::chrono::steady_clock::now();
         }
 
         DWORD streamIndex = 0;
@@ -320,7 +432,7 @@ static void worker_main(MusicFolderSource *state)
                     const size_t frameCount = safeLength / bytesPerFrame;
                     if (frameCount > 0) {
                         const auto *pcm = reinterpret_cast<const int16_t *>(bytes);
-                        (void)output_interleaved_pcm16(state, pcm, frameCount, nextTimestamp, deadline);
+                        (void)push_pcm16_to_queue(state, pcm, frameCount);
                     }
                     buffer->Unlock();
                 }
@@ -338,15 +450,77 @@ static void worker_main(MusicFolderSource *state)
         CoUninitialize();
 }
 
-static void request_rescan(MusicFolderSource *state)
+static void output_main(MusicFolderSource *state)
 {
-    if (!state)
-        return;
-    {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        state->reloadRequested = true;
+    std::array<float, kOutputFrames> left{};
+    std::array<float, kOutputFrames> right{};
+
+    uint64_t activeEpoch = std::numeric_limits<uint64_t>::max();
+    uint64_t nextTimestamp = os_gettime_ns();
+    auto nextDeadline = std::chrono::steady_clock::now();
+
+    for (;;) {
+        uint64_t blockEpoch = 0;
+        {
+            std::unique_lock<std::mutex> lock(state->mutex);
+            state->wake.wait(lock, [state] {
+                if (state->stopping)
+                    return true;
+                if (state->paused)
+                    return false;
+                const size_t required = state->prebuffering ? kPrebufferFrames : kOutputFrames;
+                return state->audioQueue.size() >= required;
+            });
+
+            if (state->stopping)
+                break;
+
+            if (state->audioQueue.size() < kOutputFrames) {
+                state->prebuffering = true;
+                continue;
+            }
+
+            blockEpoch = state->playbackEpoch;
+            if (state->prebuffering) {
+                state->prebuffering = false;
+            }
+
+            for (size_t i = 0; i < kOutputFrames; ++i) {
+                const StereoFrame frame = state->audioQueue.front();
+                state->audioQueue.pop_front();
+                left[i] = frame.left;
+                right[i] = frame.right;
+            }
+        }
+        state->wake.notify_all();
+
+        const auto now = std::chrono::steady_clock::now();
+        if (blockEpoch != activeEpoch || now > nextDeadline + 20ms) {
+            activeEpoch = blockEpoch;
+            nextTimestamp = os_gettime_ns();
+            nextDeadline = now;
+        }
+
+        obs_source_audio audio{};
+        audio.data[0] = reinterpret_cast<const uint8_t *>(left.data());
+        audio.data[1] = reinterpret_cast<const uint8_t *>(right.data());
+        audio.frames = static_cast<uint32_t>(kOutputFrames);
+        audio.speakers = SPEAKERS_STEREO;
+        audio.format = AUDIO_FORMAT_FLOAT_PLANAR;
+        audio.samples_per_sec = kSampleRate;
+        audio.timestamp = nextTimestamp;
+
+        obs_source_output_audio(state->source, &audio);
+
+        nextTimestamp += kBlockDurationNs;
+        nextDeadline += 10ms;
+
+        std::unique_lock<std::mutex> lock(state->mutex);
+        state->wake.wait_until(lock, nextDeadline, [state, blockEpoch] {
+            return state->stopping || state->paused ||
+                   state->playbackEpoch != blockEpoch;
+        });
     }
-    state->wake.notify_all();
 }
 
 static const char *music_source_name(void *)
@@ -358,6 +532,30 @@ static void music_get_defaults(obs_data_t *settings)
 {
     obs_data_set_default_string(settings, "source_name", "");
     obs_data_set_default_string(settings, "folder", "");
+}
+
+static void hotkey_toggle(void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed)
+{
+    if (pressed)
+        toggle_playback(static_cast<MusicFolderSource *>(data));
+}
+
+static void hotkey_stop(void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed)
+{
+    if (pressed)
+        stop_playback(static_cast<MusicFolderSource *>(data));
+}
+
+static void hotkey_previous(void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed)
+{
+    if (pressed)
+        skip_track(static_cast<MusicFolderSource *>(data), -1);
+}
+
+static void hotkey_next(void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed)
+{
+    if (pressed)
+        skip_track(static_cast<MusicFolderSource *>(data), 1);
 }
 
 static void *music_create(obs_data_t *settings, obs_source_t *source)
@@ -376,7 +574,22 @@ static void *music_create(obs_data_t *settings, obs_source_t *source)
 
     const char *folderUtf8 = obs_data_get_string(settings, "folder");
     state->folder = fs::path(utf8_to_wide(folderUtf8));
-    state->worker = std::thread(worker_main, state);
+
+    state->decoderThread = std::thread(decoder_main, state);
+    state->outputThread = std::thread(output_main, state);
+
+    state->toggleHotkey = obs_hotkey_register_source(
+        source, "music_folder_player_toggle_playback", obs_module_text("HotkeyTogglePlayback"),
+        hotkey_toggle, state);
+    state->stopHotkey = obs_hotkey_register_source(
+        source, "music_folder_player_stop", obs_module_text("HotkeyStopPlayback"),
+        hotkey_stop, state);
+    state->previousHotkey = obs_hotkey_register_source(
+        source, "music_folder_player_previous_track", obs_module_text("HotkeyPreviousTrack"),
+        hotkey_previous, state);
+    state->nextHotkey = obs_hotkey_register_source(
+        source, "music_folder_player_next_track", obs_module_text("HotkeyNextTrack"),
+        hotkey_next, state);
 
     obs_source_set_audio_active(source, true);
     return state;
@@ -388,13 +601,25 @@ static void music_destroy(void *data)
     if (!state)
         return;
 
+    if (state->toggleHotkey != OBS_INVALID_HOTKEY_ID)
+        obs_hotkey_unregister(state->toggleHotkey);
+    if (state->stopHotkey != OBS_INVALID_HOTKEY_ID)
+        obs_hotkey_unregister(state->stopHotkey);
+    if (state->previousHotkey != OBS_INVALID_HOTKEY_ID)
+        obs_hotkey_unregister(state->previousHotkey);
+    if (state->nextHotkey != OBS_INVALID_HOTKEY_ID)
+        obs_hotkey_unregister(state->nextHotkey);
+
     {
         std::lock_guard<std::mutex> lock(state->mutex);
         state->stopping = true;
     }
     state->wake.notify_all();
-    if (state->worker.joinable())
-        state->worker.join();
+
+    if (state->decoderThread.joinable())
+        state->decoderThread.join();
+    if (state->outputThread.joinable())
+        state->outputThread.join();
 
     if (state->source)
         obs_source_set_audio_active(state->source, false);
@@ -421,12 +646,22 @@ static void music_update(void *data, obs_data_t *settings)
         newFolder.clear();
     }
 
+    bool changed = false;
     {
         std::lock_guard<std::mutex> lock(state->mutex);
-        state->folder = std::move(newFolder);
-        state->reloadRequested = true;
+        if (state->folder != newFolder) {
+            state->folder = std::move(newFolder);
+            changed = true;
+            state->reloadRequested = true;
+            state->restartRequested = false;
+            state->pendingTrackDelta = 0;
+            state->audioQueue.clear();
+            state->prebuffering = true;
+            ++state->playbackEpoch;
+        }
     }
-    state->wake.notify_all();
+    if (changed)
+        state->wake.notify_all();
 }
 
 static bool folder_modified(void *data, obs_properties_t *, obs_property_t *, obs_data_t *settings)
@@ -443,18 +678,52 @@ static bool folder_modified(void *data, obs_properties_t *, obs_property_t *, ob
         selectedFolder.clear();
     }
 
+    bool changed = false;
     {
         std::lock_guard<std::mutex> lock(state->mutex);
-        state->folder = std::move(selectedFolder);
-        state->reloadRequested = true;
+        if (state->folder != selectedFolder) {
+            state->folder = std::move(selectedFolder);
+            changed = true;
+            state->reloadRequested = true;
+            state->restartRequested = false;
+            state->pendingTrackDelta = 0;
+            state->audioQueue.clear();
+            state->prebuffering = true;
+            ++state->playbackEpoch;
+        }
     }
-    state->wake.notify_all();
+    if (changed)
+        state->wake.notify_all();
+    return false;
+}
+
+static bool play_pause_button_clicked(obs_properties_t *, obs_property_t *, void *data)
+{
+    toggle_playback(static_cast<MusicFolderSource *>(data));
+    return false;
+}
+
+static bool stop_button_clicked(obs_properties_t *, obs_property_t *, void *data)
+{
+    stop_playback(static_cast<MusicFolderSource *>(data));
+    return false;
+}
+
+static bool previous_button_clicked(obs_properties_t *, obs_property_t *, void *data)
+{
+    skip_track(static_cast<MusicFolderSource *>(data), -1);
+    return false;
+}
+
+static bool next_button_clicked(obs_properties_t *, obs_property_t *, void *data)
+{
+    skip_track(static_cast<MusicFolderSource *>(data), 1);
     return false;
 }
 
 static bool rescan_button_clicked(obs_properties_t *, obs_property_t *, void *data)
 {
-    request_rescan(static_cast<MusicFolderSource *>(data));
+    request_reload(static_cast<MusicFolderSource *>(data));
     return false;
 }
 
@@ -468,13 +737,20 @@ static obs_properties_t *music_get_properties(void *data)
     obs_properties_add_text(props, "source_name", obs_module_text("SourceName"), OBS_TEXT_DEFAULT);
     obs_property_t *folder = obs_properties_add_path(props, "folder", obs_module_text("MusicFolder"),
                                                        OBS_PATH_DIRECTORY, nullptr, nullptr);
-    // Apply the folder as soon as it is selected, before the properties dialog closes.
     obs_property_set_modified_callback2(folder, folder_modified, data);
+
+    obs_properties_add_button2(props, "play_pause", obs_module_text("PlayPause"),
+                                play_pause_button_clicked, data);
+    obs_properties_add_button2(props, "stop", obs_module_text("Stop"),
+                                stop_button_clicked, data);
+    obs_properties_add_button2(props, "previous", obs_module_text("Previous"),
+                                previous_button_clicked, data);
+    obs_properties_add_button2(props, "next", obs_module_text("Next"),
+                                next_button_clicked, data);
     obs_properties_add_button2(props, "add_music", obs_module_text("AddRescan"),
                                 rescan_button_clicked, data);
     return props;
 }
-
 } // namespace
 
 void register_music_folder_source()
