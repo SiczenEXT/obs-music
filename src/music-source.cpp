@@ -49,7 +49,7 @@ static std::wstring utf8_to_wide(const char *text)
     if (needed <= 0)
         return {};
 
-    std::wstring result(static_cast<size_t>(needed), L'\\0');
+    std::wstring result(static_cast<size_t>(needed), L'\0');
     MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, result.data(), needed);
     result.pop_back();
     return result;
@@ -64,7 +64,7 @@ static std::string wide_to_utf8(const std::wstring &text)
     if (needed <= 0)
         return {};
 
-    std::string result(static_cast<size_t>(needed), '\\0');
+    std::string result(static_cast<size_t>(needed), '\0');
     WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, result.data(), needed, nullptr, nullptr);
     result.pop_back();
     return result;
