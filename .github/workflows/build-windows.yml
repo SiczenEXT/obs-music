@@ -44,6 +44,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: OBS-Music-Folder-Player-Windows-x64
-          path: release/obs-music-folder-1.0.0-windows-x64.zip
+          path: release/obs-music-folder-*-windows-x64.zip
           if-no-files-found: error
           compression-level: 0
