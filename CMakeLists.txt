@@ -28,4 +28,10 @@ target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
   NOMINMAX
   _CRT_SECURE_NO_WARNINGS
 )
+
+# Preserve compatibility with Windows SDK COM/WRL headers under OBS template flags.
+if(MSVC)
+  target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE /Zc:twoPhase-)
+endif()
+
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
