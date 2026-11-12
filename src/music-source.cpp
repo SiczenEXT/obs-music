@@ -2,6 +2,7 @@
 #include <util/platform.h>
 
 #include <windows.h>
+#include <ks.h>
 #include <ksmedia.h>
 #include <mfapi.h>
 #include <mferror.h>
