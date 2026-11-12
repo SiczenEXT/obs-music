@@ -2,8 +2,6 @@
 #include <util/platform.h>
 
 #include <windows.h>
-#include <ks.h>
-#include <ksmedia.h>
 #include <mfapi.h>
 #include <mferror.h>
 #include <mfidl.h>
@@ -67,7 +65,7 @@ static std::string wide_to_utf8(const std::wstring &text)
         return {};
 
     std::string result(static_cast<size_t>(needed), '\\0');
-    WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, result.data(), needed);
+    WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, result.data(), needed, nullptr, nullptr);
     result.pop_back();
     return result;
 }
@@ -143,7 +141,7 @@ static HRESULT create_audio_reader(const fs::path &file, ComPtr<IMFSourceReader>
                                kSampleRate * kChannels * sizeof(int16_t));
     if (FAILED(hr)) return hr;
     hr = outputType->SetUINT32(MF_MT_AUDIO_CHANNEL_MASK,
-                               SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT);
+                               0x00000003U);
     if (FAILED(hr)) return hr;
     hr = outputType->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
     if (FAILED(hr)) return hr;
