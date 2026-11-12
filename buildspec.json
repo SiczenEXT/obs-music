@@ -38,7 +38,7 @@
   },
   "name": "obs-music-folder",
   "displayName": "OBS Music Folder Player",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "SiczenEXT",
   "website": "https://github.com/SiczenEXT/obs-music",
   "email": "siczenext@gmail.com"
