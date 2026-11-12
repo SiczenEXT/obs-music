@@ -17,6 +17,7 @@
 #include <cwctype>
 #include <deque>
 #include <filesystem>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
